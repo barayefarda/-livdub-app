@@ -22,11 +22,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -40,7 +40,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import com.livdub.app.floating.FloatingBubbleService
+import com.livdub.app.service.FloatingBubbleService
 import com.livdub.app.service.LiveDubbingService
 
 class MainActivity : ComponentActivity() {
@@ -61,19 +61,33 @@ class MainActivity : ComponentActivity() {
     private val overlayPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        if (Settings.canDrawOverlays(this)) {
+        if (hasOverlayPermission()) {
             startFloatingBubble()
         } else {
-            Toast.makeText(this, "مجوز نمایش روی سایر برنامه‌ها رد شد", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "مجوز نمایش روی سایر برنامه‌ها داده نشد", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private val audioPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            requestNotificationThenProjection()
+        } else {
+            Toast.makeText(this, "مجوز دسترسی به صدا ضروری است", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        launchProjectionPicker()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("livdub_settings", Context.MODE_PRIVATE)
         projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-
-        requestRequiredPermissions()
 
         setContent {
             MaterialTheme {
@@ -89,18 +103,14 @@ class MainActivity : ComponentActivity() {
                         if (LiveDubbingService.isRunning) {
                             stopDubbingService()
                         } else {
-                            initiateCapture()
+                            checkPermissionsAndStart()
                         }
                     },
                     onToggleFloatingBubble = {
-                        if (Settings.canDrawOverlays(this)) {
+                        if (hasOverlayPermission()) {
                             startFloatingBubble()
                         } else {
-                            val intent = Intent(
-                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                Uri.parse("package:$packageName")
-                            )
-                            overlayPermissionLauncher.launch(intent)
+                            requestOverlayPermission()
                         }
                     }
                 )
@@ -108,28 +118,46 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestRequiredPermissions() {
-        val permissions = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            permissions.add(Manifest.permission.RECORD_AUDIO)
-        }
-        if (permissions.isNotEmpty()) {
-            registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}.launch(permissions.toTypedArray())
+    private fun hasOverlayPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Settings.canDrawOverlays(this)
+        } else true
+    }
+
+    private fun requestOverlayPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")
+            )
+            overlayPermissionLauncher.launch(intent)
         }
     }
 
-    private fun initiateCapture() {
+    private fun checkPermissionsAndStart() {
         val apiKey = prefs.getString("gemini_api_key", "") ?: ""
         if (apiKey.isBlank()) {
             Toast.makeText(this, "لطفاً ابتدا کلید API جمینای خود را وارد کنید", Toast.LENGTH_LONG).show()
             return
         }
 
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            requestNotificationThenProjection()
+        }
+    }
+
+    private fun requestNotificationThenProjection() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            launchProjectionPicker()
+        }
+    }
+
+    private fun launchProjectionPicker() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val captureIntent = projectionManager.createScreenCaptureIntent()
             mediaProjectionLauncher.launch(captureIntent)
@@ -173,9 +201,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startFloatingBubble() {
-        val intent = Intent(this, FloatingBubbleService::class.java)
-        startService(intent)
-        Toast.makeText(this, "دکمه شناور روی صفحه فعال شد", Toast.LENGTH_SHORT).show()
+        try {
+            val intent = Intent(this, FloatingBubbleService::class.java)
+            startService(intent)
+            Toast.makeText(this, "دکمه شناور روی صفحه فعال شد", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "خطا در اجرای دکمه شناور: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
     }
 }
 
@@ -197,8 +229,6 @@ fun MainScreen(
     var selectedBoost by remember { mutableStateOf(volumeBoost) }
     var activeState by remember { mutableStateOf(isDubbingActive) }
 
-    val languages = listOf("Persian (Farsi)", "Arabic", "Turkish", "Spanish", "French", "German", "Russian", "Hindi")
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -217,7 +247,12 @@ fun MainScreen(
                                 .background(Color(0xFF38BDF8))
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         ) {
-                            Text(text = "LIVE", fontSize = 10.sp, fontWeight = FontWeight.Black, color = Color(0xFF0F172A))
+                            Text(
+                                text = "LIVE",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Black,
+                                color = Color(0xFF0F172A)
+                            )
                         }
                     }
                 },
@@ -256,7 +291,7 @@ fun MainScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            imageVector = if (activeState) Icons.Default.PlayArrow else Icons.Default.Stop,
+                            imageVector = if (activeState) Icons.Default.PlayArrow else Icons.Default.Close,
                             contentDescription = null,
                             tint = Color.White,
                             modifier = Modifier.size(32.dp)
@@ -296,7 +331,7 @@ fun MainScreen(
                     .height(54.dp)
             ) {
                 Icon(
-                    imageVector = if (activeState) Icons.Default.Stop else Icons.Default.PlayArrow,
+                    imageVector = if (activeState) Icons.Default.Close else Icons.Default.PlayArrow,
                     contentDescription = null
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -317,7 +352,7 @@ fun MainScreen(
                     .fillMaxWidth()
                     .height(48.dp)
             ) {
-                Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(18.dp))
+                Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(text = "نمایش دکمه شناور روی صفحه (Overlay)")
             }
@@ -376,7 +411,7 @@ fun MainScreen(
                         },
                         label = { Text(lang) },
                         leadingIcon = if (selectedLang == lang) {
-                            { Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                            { Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp)) }
                         } else null
                     )
                 }
@@ -436,7 +471,7 @@ fun MainScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Useful Tip Card
+            // Tip Card
             Card(
                 shape = RoundedCornerShape(12.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF)),
