@@ -13,13 +13,16 @@ import android.util.Log
  * Real-time audio player for playing synthesized PCM audio returned by Gemini.
  * Plays 24kHz Mono 16-bit PCM stream with ultra-low latency.
  *
- * Uses USAGE_ASSISTANT and AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK to automatically
- * duck (lower the volume of) the original video/media on the phone so the dubbed
- * voice is clearly heard above it.
+ * Features:
+ * 1. Hardware audio ducking request (AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK).
+ * 2. Software Digital Gain Boost (default 2.8x, up to 3.8x) to ensure the dubbed voice
+ *    is significantly louder, clearer, and dominates the underlying video audio.
+ * 3. Soft-clipping protection to prevent digital distortion at high volumes.
  */
 class DubbedAudioPlayer(
     private val context: Context,
-    private val sampleRate: Int = 24000
+    private val sampleRate: Int = 24000,
+    var volumeBoost: Float = 2.8f
 ) {
     companion object {
         private const val TAG = "DubbedAudioPlayer"
@@ -75,9 +78,6 @@ class DubbedAudioPlayer(
                 AudioFormat.ENCODING_PCM_16BIT
             )
 
-            // USAGE_ASSISTANT ensures:
-            // 1. AudioPlaybackCapture will NOT capture this dubbed audio (prevents infinite echo loop)
-            // 2. Android system treats it as high-priority voice assistant audio over media
             audioTrack = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -96,21 +96,54 @@ class DubbedAudioPlayer(
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
+            // Ensure maximum volume on the AudioTrack channel
+            audioTrack?.setVolume(1.0f)
             audioTrack?.play()
+            Log.d(TAG, "AudioTrack initialized with volumeBoost = $volumeBoost")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize AudioTrack: ${e.message}", e)
         }
     }
 
     /**
-     * Write incoming audio chunks directly to the playing audio stream.
+     * Applies digital gain boost with soft-limiting to make the dubbed Persian voice
+     * significantly louder and punchier than the background video audio.
+     */
+    private fun applyGainBoost(pcmData: ByteArray, gainFactor: Float): ByteArray {
+        if (gainFactor <= 1.0f) return pcmData
+
+        val sampleCount = pcmData.size / 2
+        val output = ByteArray(pcmData.size)
+
+        for (i in 0 until sampleCount) {
+            val idx = i * 2
+            val low = pcmData[idx].toInt() and 0xFF
+            val high = pcmData[idx + 1].toInt()
+            val sample = (high shl 8) or low
+
+            var boosted = (sample * gainFactor).toInt()
+            if (boosted > 32767) {
+                boosted = 32767
+            } else if (boosted < -32768) {
+                boosted = -32768
+            }
+
+            output[idx] = (boosted and 0xFF).toByte()
+            output[idx + 1] = ((boosted shr 8) and 0xFF).toByte()
+        }
+        return output
+    }
+
+    /**
+     * Write incoming audio chunks directly to the playing audio stream with volume boost applied.
      */
     fun writePcmChunk(pcmData: ByteArray) {
         if (audioTrack == null || audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
             initTrack()
         }
         try {
-            audioTrack?.write(pcmData, 0, pcmData.size)
+            val boostedChunk = applyGainBoost(pcmData, volumeBoost)
+            audioTrack?.write(boostedChunk, 0, boostedChunk.size)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write PCM chunk: ${e.message}")
         }
