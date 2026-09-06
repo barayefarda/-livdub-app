@@ -115,8 +115,8 @@ class LiveDubbingService : Service() {
         isRunning = true
 
         try {
-            // 1. Initialize output player
-            dubbedPlayer = DubbedAudioPlayer(sampleRate = 24000)
+            // 1. Initialize output player with ducking capability
+            dubbedPlayer = DubbedAudioPlayer(context = this, sampleRate = 24000)
 
             // 2. Initialize Gemini Live connection
             geminiSession = GeminiLiveSession(
