@@ -22,7 +22,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -30,141 +35,113 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import com.livdub.app.service.FloatingBubbleService
+import com.livdub.app.floating.FloatingBubbleService
 import com.livdub.app.service.LiveDubbingService
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var prefs: SharedPreferences
+    private lateinit var projectionManager: MediaProjectionManager
 
-    private val projectionLauncher = registerForActivityResult(
+    private val mediaProjectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             startDubbingService(result.resultCode, result.data!!)
         } else {
-            Toast.makeText(this, "Screen/audio capture permission denied", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "مجوز ضبط صدای سیستم رد شد", Toast.LENGTH_SHORT).show()
         }
-    }
-
-    private val audioPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (isGranted) {
-            requestNotificationThenProjection()
-        } else {
-            Toast.makeText(this, "Audio recording permission is required for system dubbing", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    private val notificationPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { _ ->
-        launchMediaProjectionPicker()
     }
 
     private val overlayPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        if (hasOverlayPermission()) {
-            startBubbleService()
+        if (Settings.canDrawOverlays(this)) {
+            startFloatingBubble()
+        } else {
+            Toast.makeText(this, "مجوز نمایش روی سایر برنامه‌ها رد شد", Toast.LENGTH_SHORT).show()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        prefs = getSharedPreferences("livdub_prefs", Context.MODE_PRIVATE)
+        prefs = getSharedPreferences("livdub_settings", Context.MODE_PRIVATE)
+        projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+        requestRequiredPermissions()
 
         setContent {
-            LivdubAppScreen(
-                isDubbingActive = LiveDubbingService.isRunning,
-                apiKey = prefs.getString("gemini_api_key", "") ?: "",
-                targetLang = prefs.getString("target_lang", "Persian (Farsi)") ?: "Persian (Farsi)",
-                onSaveApiKey = { key -> prefs.edit().putString("gemini_api_key", key).apply() },
-                onSaveLang = { lang -> prefs.edit().putString("target_lang", lang).apply() },
-                onToggleDubbing = {
-                    if (LiveDubbingService.isRunning) {
-                        stopDubbingService()
-                    } else {
-                        checkAndRequestPermissions()
+            MaterialTheme {
+                MainScreen(
+                    isDubbingActive = LiveDubbingService.isRunning,
+                    apiKey = prefs.getString("gemini_api_key", "") ?: "",
+                    targetLang = prefs.getString("target_lang", "Persian (Farsi)") ?: "Persian (Farsi)",
+                    volumeBoost = prefs.getFloat("volume_boost", 2.8f),
+                    onSaveApiKey = { key -> prefs.edit().putString("gemini_api_key", key).apply() },
+                    onSaveLang = { lang -> prefs.edit().putString("target_lang", lang).apply() },
+                    onSaveVolumeBoost = { boost -> prefs.edit().putFloat("volume_boost", boost).apply() },
+                    onToggleDubbing = {
+                        if (LiveDubbingService.isRunning) {
+                            stopDubbingService()
+                        } else {
+                            initiateCapture()
+                        }
+                    },
+                    onToggleFloatingBubble = {
+                        if (Settings.canDrawOverlays(this)) {
+                            startFloatingBubble()
+                        } else {
+                            val intent = Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:$packageName")
+                            )
+                            overlayPermissionLauncher.launch(intent)
+                        }
                     }
-                },
-                onToggleFloatingBubble = {
-                    if (hasOverlayPermission()) {
-                        startBubbleService()
-                    } else {
-                        requestOverlayPermission()
-                    }
-                }
-            )
+                )
+            }
         }
     }
 
-    private fun hasOverlayPermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Settings.canDrawOverlays(this)
-        } else true
-    }
-
-    private fun requestOverlayPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-            overlayPermissionLauncher.launch(intent)
+    private fun requestRequiredPermissions() {
+        val permissions = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            permissions.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (permissions.isNotEmpty()) {
+            registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}.launch(permissions.toTypedArray())
         }
     }
 
-    private fun startBubbleService() {
-        try {
-            startService(Intent(this, FloatingBubbleService::class.java))
-            Toast.makeText(this, "Floating bubble enabled! Tap anytime to dub.", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            Toast.makeText(this, "Could not start bubble: ${e.message}", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun checkAndRequestPermissions() {
+    private fun initiateCapture() {
         val apiKey = prefs.getString("gemini_api_key", "") ?: ""
         if (apiKey.isBlank()) {
-            Toast.makeText(this, "Please enter your Gemini API Key first", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "لطفاً ابتدا کلید API جمینای خود را وارد کنید", Toast.LENGTH_LONG).show()
             return
         }
 
-        // 1. First check RECORD_AUDIO runtime permission
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val captureIntent = projectionManager.createScreenCaptureIntent()
+            mediaProjectionLauncher.launch(captureIntent)
         } else {
-            requestNotificationThenProjection()
-        }
-    }
-
-    private fun requestNotificationThenProjection() {
-        // 2. On Android 13+ check notification permission
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        } else {
-            launchMediaProjectionPicker()
-        }
-    }
-
-    private fun launchMediaProjectionPicker() {
-        try {
-            val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            projectionLauncher.launch(mpManager.createScreenCaptureIntent())
-        } catch (e: Exception) {
-            Toast.makeText(this, "Failed to launch screen capture: ${e.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "این قابلیت نیازمند اندروید ۱۰ به بالا است", Toast.LENGTH_LONG).show()
         }
     }
 
     private fun startDubbingService(resultCode: Int, data: Intent) {
         val apiKey = prefs.getString("gemini_api_key", "") ?: ""
         val targetLang = prefs.getString("target_lang", "Persian (Farsi)") ?: "Persian (Farsi)"
+        val volumeBoost = prefs.getFloat("volume_boost", 2.8f)
 
         val intent = Intent(this, LiveDubbingService::class.java).apply {
             action = LiveDubbingService.ACTION_START
@@ -172,6 +149,7 @@ class MainActivity : ComponentActivity() {
             putExtra(LiveDubbingService.EXTRA_RESULT_DATA, data)
             putExtra(LiveDubbingService.EXTRA_API_KEY, apiKey)
             putExtra(LiveDubbingService.EXTRA_TARGET_LANG, targetLang)
+            putExtra(LiveDubbingService.EXTRA_VOLUME_BOOST, volumeBoost)
         }
 
         try {
@@ -180,8 +158,9 @@ class MainActivity : ComponentActivity() {
             } else {
                 startService(intent)
             }
+            Toast.makeText(this, "دوبله زنده آغاز شد! ویدیو را پخش کنید.", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
-            Toast.makeText(this, "Could not start service: ${e.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "خطا در شروع سرویس: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -190,22 +169,32 @@ class MainActivity : ComponentActivity() {
             action = LiveDubbingService.ACTION_STOP
         }
         startService(intent)
+        Toast.makeText(this, "دوبله همزمان متوقف شد", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun startFloatingBubble() {
+        val intent = Intent(this, FloatingBubbleService::class.java)
+        startService(intent)
+        Toast.makeText(this, "دکمه شناور روی صفحه فعال شد", Toast.LENGTH_SHORT).show()
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LivdubAppScreen(
+fun MainScreen(
     isDubbingActive: Boolean,
     apiKey: String,
     targetLang: String,
+    volumeBoost: Float,
     onSaveApiKey: (String) -> Unit,
     onSaveLang: (String) -> Unit,
+    onSaveVolumeBoost: (Float) -> Unit,
     onToggleDubbing: () -> Unit,
     onToggleFloatingBubble: () -> Unit
 ) {
     var keyText by remember { mutableStateOf(apiKey) }
     var selectedLang by remember { mutableStateOf(targetLang) }
+    var selectedBoost by remember { mutableStateOf(volumeBoost) }
     var activeState by remember { mutableStateOf(isDubbingActive) }
 
     val languages = listOf("Persian (Farsi)", "Arabic", "Turkish", "Spanish", "French", "German", "Russian", "Hindi")
@@ -216,118 +205,128 @@ fun LivdubAppScreen(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = "Livdub Android",
+                            text = "Livdub AI",
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFF1E293B)
+                            fontSize = 20.sp,
+                            color = Color.White
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            shape = CircleShape,
-                            color = if (activeState) Color(0xFF10B981) else Color(0xFF94A3B8),
-                            modifier = Modifier.size(10.dp)
-                        ) {}
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(Color(0xFF38BDF8))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(text = "LIVE", fontSize = 10.sp, fontWeight = FontWeight.Black, color = Color(0xFF0F172A))
+                        }
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFFF8FAFC))
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color(0xFF0F172A)
+                )
             )
         }
-    ) { padding ->
+    ) { paddingValues ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
                 .background(Color(0xFFF8FAFC))
+                .padding(paddingValues)
                 .verticalScroll(rememberScrollState())
                 .padding(20.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Hero Status Card
+            // Status Card
             Card(
-                shape = RoundedCornerShape(20.dp),
+                shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(
-                    containerColor = if (activeState) Color(0xFF4F46E5) else Color(0xFFFFFFFF)
+                    containerColor = if (activeState) Color(0xFFDCFCE7) else Color(0xFFF1F5F9)
                 ),
-                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
-                    modifier = Modifier.padding(24.dp),
+                    modifier = Modifier.padding(20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Box(
                         modifier = Modifier
-                            .size(72.dp)
+                            .size(56.dp)
                             .clip(CircleShape)
-                            .background(if (activeState) Color.White.copy(alpha = 0.2f) else Color(0xFFEEF2FF)),
+                            .background(if (activeState) Color(0xFF22C55E) else Color(0xFF94A3B8)),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            imageVector = if (activeState) Icons.Default.GraphicEq else Icons.Default.Mic,
+                            imageVector = if (activeState) Icons.Default.PlayArrow else Icons.Default.Stop,
                             contentDescription = null,
-                            tint = if (activeState) Color.White else Color(0xFF4F46E5),
-                            modifier = Modifier.size(36.dp)
+                            tint = Color.White,
+                            modifier = Modifier.size(32.dp)
                         )
                     }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
+                    Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        text = if (activeState) "Live Dubbing Active" else "Ready to Dub System Audio",
-                        fontSize = 20.sp,
+                        text = if (activeState) "دوبله همزمان در حال اجراست" else "سیستم آماده به کار است",
                         fontWeight = FontWeight.Bold,
-                        color = if (activeState) Color.White else Color(0xFF0F172A)
+                        fontSize = 17.sp,
+                        color = if (activeState) Color(0xFF15803D) else Color(0xFF334155)
                     )
-
                     Text(
-                        text = if (activeState)
-                            "Capturing phone audio and translating to $selectedLang"
-                        else
-                            "Translate YouTube, Instagram, podcasts or browser audio in real time",
-                        fontSize = 14.sp,
-                        color = if (activeState) Color.White.copy(alpha = 0.8f) else Color(0xFF64748B),
-                        modifier = Modifier.padding(top = 6.dp)
+                        text = if (activeState) "صدای فیلم به صورت آنی به $selectedLang دوبله می‌شود" else "دکمه زیر را برای شروع دوبله لمس کنید",
+                        fontSize = 13.sp,
+                        color = Color(0xFF64748B),
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(top = 4.dp)
                     )
-
-                    Spacer(modifier = Modifier.height(20.dp))
-
-                    Button(
-                        onClick = {
-                            activeState = !activeState
-                            onToggleDubbing()
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (activeState) Color(0xFFEF4444) else Color(0xFF4F46E5)
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = if (activeState) "Stop Dubbing" else "Start Live Dubbing",
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
                 }
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(20.dp))
 
-            // Floating Bubble Quick Action
+            // Start/Stop Primary Button
+            Button(
+                onClick = {
+                    activeState = !activeState
+                    onToggleDubbing()
+                },
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (activeState) Color(0xFFEF4444) else Color(0xFF2563EB)
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp)
+            ) {
+                Icon(
+                    imageVector = if (activeState) Icons.Default.Stop else Icons.Default.PlayArrow,
+                    contentDescription = null
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (activeState) "توقف دوبله همزمان" else "شروع دوبله روی فیلم‌ها",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Floating Bubble Button
             OutlinedButton(
                 onClick = onToggleFloatingBubble,
                 shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
             ) {
-                Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(20.dp))
+                Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Enable Floating Screen Bubble")
+                Text(text = "نمایش دکمه شناور روی صفحه (Overlay)")
             }
 
             Spacer(modifier = Modifier.height(24.dp))
 
             // Settings Section
             Text(
-                text = "Dubbing Settings",
+                text = "تنظیمات هوش مصنوعی جمینای",
                 fontWeight = FontWeight.Bold,
                 fontSize = 16.sp,
                 color = Color(0xFF0F172A),
@@ -336,7 +335,7 @@ fun LivdubAppScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // API Key Input
+            // Gemini API Key Input
             OutlinedTextField(
                 value = keyText,
                 onValueChange = {
@@ -344,17 +343,19 @@ fun LivdubAppScreen(
                     onSaveApiKey(it)
                 },
                 label = { Text("Gemini API Key") },
-                placeholder = { Text("Enter AI Studio API Key...") },
+                placeholder = { Text("کلید هوش مصنوعی را اینجا وارد کنید") },
                 singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth()
             )
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Target Language Picker
+            // Target Language Selection
             Text(
-                text = "Target Dubbing Language",
+                text = "زبان مقصد دوبله (Target Language)",
+                fontWeight = FontWeight.Medium,
                 fontSize = 14.sp,
                 color = Color(0xFF475569),
                 modifier = Modifier.align(Alignment.Start)
@@ -362,8 +363,11 @@ fun LivdubAppScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            Row(modifier = Modifier.fillMaxWidth()) {
-                languages.take(3).forEach { lang ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf("Persian (Farsi)", "Arabic", "Turkish").forEach { lang ->
                     FilterChip(
                         selected = selectedLang == lang,
                         onClick = {
@@ -371,7 +375,89 @@ fun LivdubAppScreen(
                             onSaveLang(lang)
                         },
                         label = { Text(lang) },
-                        modifier = Modifier.padding(end = 8.dp)
+                        leadingIcon = if (selectedLang == lang) {
+                            { Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                        } else null
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // Volume Boost Section
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Dubbing Volume Boost (بلندی صدای دوبله)",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    color = Color(0xFF0F172A)
+                )
+                Text(
+                    text = "${(selectedBoost * 100).toInt()}%",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    color = Color(0xFF4F46E5)
+                )
+            }
+
+            Text(
+                text = "تقویت دیجیتال صدای دوبله تا کاملاً بلندتر و واضح‌تر از صدای زمینه فیلم شنیده شود.",
+                fontSize = 12.sp,
+                color = Color(0xFF64748B),
+                modifier = Modifier
+                    .align(Alignment.Start)
+                    .padding(top = 4.dp, bottom = 10.dp)
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                val boostOptions = listOf(
+                    1.8f to "۱۸۰٪ (معمولی)",
+                    2.8f to "۲۸۰٪ (پیشنهادی)",
+                    3.8f to "۳۸۰٪ (حداکثر)"
+                )
+                boostOptions.forEach { (boost, label) ->
+                    FilterChip(
+                        selected = kotlin.math.abs(selectedBoost - boost) < 0.1f,
+                        onClick = {
+                            selectedBoost = boost
+                            onSaveVolumeBoost(boost)
+                        },
+                        label = { Text(label, fontSize = 12.sp) }
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Useful Tip Card
+            Card(
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.VolumeUp,
+                        contentDescription = null,
+                        tint = Color(0xFF2563EB),
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "راهکار برتر: هنگام پخش فیلم در یوتیوب یا اینستاگرام، ولوم صدای گوشی را در حدود ۴۰٪ تا ۵۰٪ تنظیم کنید. به دلیل تقویت ۲۸۰٪، صدای دوبله فارسی بسیار رسا و غالب پخش شده و صدای اصلی فیلم در پس‌زمینه کم‌رنگ می‌شود.",
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp,
+                        color = Color(0xFF1E40AF)
                     )
                 }
             }
