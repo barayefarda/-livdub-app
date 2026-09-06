@@ -3,15 +3,12 @@ package com.livdub.app.gemini
 import android.util.Base64
 import android.util.Log
 import okhttp3.*
-import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * Manages two-way real-time streaming WebSocket connection with Gemini Live API:
- * 1. Sends PCM audio chunks captured from system audio playback.
- * 2. Receives live synthesized translated voice audio and dispatches to AudioTrack.
+ * Manages two-way real-time streaming WebSocket connection with Gemini Live API
  */
 class GeminiLiveSession(
     private val apiKey: String,
@@ -29,13 +26,15 @@ class GeminiLiveSession(
 
     companion object {
         private const val TAG = "GeminiLiveSession"
-        private const val MODEL_NAME = "models/gemini-2.0-flash-exp"
+        private const val MODEL_NAME = "models/gemini-2.0-flash-realtime-exp"
         private const val HOST = "generativelanguage.googleapis.com"
     }
 
     private val client = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     private var webSocket: WebSocket? = null
@@ -43,11 +42,11 @@ class GeminiLiveSession(
 
     fun start() {
         if (apiKey.isBlank()) {
-            onStateChanged(SessionState.ERROR, "API key is missing")
+            onStateChanged(SessionState.ERROR, "کلید API وارد نشده است")
             return
         }
 
-        onStateChanged(SessionState.CONNECTING, "Connecting to Gemini Live...")
+        onStateChanged(SessionState.CONNECTING, "در حال اتصال به جمینای...")
 
         val url = "wss://$HOST/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=$apiKey"
         val request = Request.Builder().url(url).build()
@@ -64,19 +63,27 @@ class GeminiLiveSession(
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "WebSocket closing: $code / $reason")
-                onStateChanged(SessionState.DISCONNECTED, "Session closed: $reason")
+                onStateChanged(SessionState.DISCONNECTED, "ارتباط بسته شد: $reason")
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.e(TAG, "WebSocket failure: ${t.message}", t)
-                onStateChanged(SessionState.ERROR, t.message ?: "Connection failure")
+                val rawMsg = t.message ?: ""
+                val friendlyMsg = when {
+                    rawMsg.contains("ping", ignoreCase = true) || rawMsg.contains("timed out", ignoreCase = true) ->
+                        "تایم‌اوت ارتباط: فیلترشکن را بررسی کنید"
+                    rawMsg.contains("Failed to connect", ignoreCase = true) ->
+                        "عدم دسترسی به گوگل: اتصال فیلترشکن را بررسی کنید"
+                    rawMsg.contains("403", ignoreCase = true) ->
+                        "خطای دسترسی ۴۰۳: کلید API نامعتبر است یا کشور تحریم است"
+                    else ->
+                        "خطای ارتباط: ${t.localizedMessage ?: "Unknown error"}"
+                }
+                onStateChanged(SessionState.ERROR, friendlyMsg)
             }
         })
     }
 
-    /**
-     * Initial handshake configuration: sets model instructions to act as a simultaneous live dubber.
-     */
     private fun sendInitialSetup() {
         try {
             val setupPayload = JSONObject().apply {
@@ -89,7 +96,7 @@ class GeminiLiveSession(
                         put("speechConfig", JSONObject().apply {
                             put("voiceConfig", JSONObject().apply {
                                 put("prebuiltVoiceConfig", JSONObject().apply {
-                                    put("voiceName", "Kore") // Natural clear voice
+                                    put("voiceName", "Kore")
                                 })
                             })
                         })
@@ -113,16 +120,14 @@ class GeminiLiveSession(
 
             webSocket?.send(setupPayload.toString())
             isSetupCompleted = true
-            onStateChanged(SessionState.CONNECTED, "Live translation active ($targetLanguage)")
+            onStateChanged(SessionState.CONNECTED, "دوبله زنده فعال است ($targetLanguage)")
             Log.d(TAG, "Setup sent successfully.")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send setup message: ${e.message}", e)
+            onStateChanged(SessionState.ERROR, "خطا در تنظیمات مدل: ${e.message}")
         }
     }
 
-    /**
-     * Send real-time audio chunk to Gemini (encoded as base64 PCM 16kHz Mono).
-     */
     fun sendAudioChunk(pcmChunk: ByteArray) {
         if (!isSetupCompleted || webSocket == null) return
 
@@ -144,9 +149,6 @@ class GeminiLiveSession(
         }
     }
 
-    /**
-     * Parse server-sent audio chunks from Gemini model response.
-     */
     private fun handleIncomingMessage(text: String) {
         try {
             val json = JSONObject(text)
@@ -158,7 +160,6 @@ class GeminiLiveSession(
                 val part = parts.getJSONObject(i)
                 val inlineData = part.optJSONObject("inlineData")
                 if (inlineData != null) {
-                    val mimeType = inlineData.optString("mimeType")
                     val b64Data = inlineData.optString("data")
                     if (b64Data.isNotEmpty()) {
                         val pcmBytes = Base64.decode(b64Data, Base64.DEFAULT)
@@ -179,6 +180,6 @@ class GeminiLiveSession(
             Log.e(TAG, "Error closing websocket: ${e.message}")
         }
         webSocket = null
-        onStateChanged(SessionState.DISCONNECTED, "Disconnected")
+        onStateChanged(SessionState.DISCONNECTED, "ارتباط قطع شد")
     }
 }
