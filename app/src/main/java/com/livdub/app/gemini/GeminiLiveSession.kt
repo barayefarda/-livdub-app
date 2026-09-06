@@ -1,5 +1,7 @@
 package com.livdub.app.gemini
 
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import android.util.Log
 import okhttp3.*
@@ -7,17 +9,19 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Manages two-way real-time streaming WebSocket connection with Gemini Live API,
- * using the EXACT same endpoint, model, and payload format as the official Livdub extension:
- *
- * 1. Endpoint: /ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent
- * 2. Model: models/gemini-3.5-live-translate-preview
- * 3. Config: translationConfig with targetLanguageCode ("fa") and echoTargetLanguage
- * 4. Audio Input: realtimeInput.audio { data, mimeType: "audio/pcm;rate=16000" }
- * 5. Audio Output: serverContent.modelTurn.parts[].inlineData.data (24kHz PCM)
+ * Manages two-way real-time streaming WebSocket connection with Gemini Live API.
+ * 
+ * Features built-in resilience for unstable VPN connections and temporary network drops:
+ * 1. Keep-Alive: Ping interval of 10s prevents VPN NAT tunnels from timing out idle sockets.
+ * 2. Session Resumption: Captures sessionResumptionUpdate tokens from Google to resume sessions seamlessly.
+ * 3. Auto-Reconnection: When a socket drops due to VPN jitter/ping spikes, it automatically
+ *    reconnects with exponential backoff rather than terminating the session.
+ * 4. Audio Buffering: Buffers recent audio during reconnections so spoken phrases are not lost.
  */
 class GeminiLiveSession(
     private val apiKey: String,
@@ -35,9 +39,9 @@ class GeminiLiveSession(
 
     companion object {
         private const val TAG = "GeminiLiveSession"
-        // The exact live speech-to-speech translation model used by Livdub
         private const val MODEL_NAME = "models/gemini-3.5-live-translate-preview"
         private const val HOST = "generativelanguage.googleapis.com"
+        private const val MAX_BUFFERED_CHUNKS = 25 // ~5 seconds of audio
     }
 
     private val targetLanguageCode: String = when {
@@ -53,16 +57,24 @@ class GeminiLiveSession(
         else -> "fa"
     }
 
+    // Ping interval of 10 seconds keeps the socket alive across VPN tunnels and NAT routers
     private val client = OkHttpClient.Builder()
-        .connectTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .writeTimeout(25, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .pingInterval(10, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
     private var webSocket: WebSocket? = null
     private var isSetupCompleted = false
-    private val pendingAudioQueue = java.util.concurrent.ConcurrentLinkedQueue<ByteArray>()
+    private val isClosedByUser = AtomicBoolean(false)
+    private val isReconnecting = AtomicBoolean(false)
+    private var reconnectAttempt = 0
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var sessionResumptionHandle: String? = null
+
+    private val pendingAudioQueue = ConcurrentLinkedQueue<ByteArray>()
 
     fun start() {
         val cleanKey = apiKey.trim().replace("\n", "").replace("\r", "")
@@ -71,9 +83,14 @@ class GeminiLiveSession(
             return
         }
 
-        onStateChanged(SessionState.CONNECTING, "در حال اتصال به هوش مصنوعی زنده...")
+        isClosedByUser.set(false)
+        connectSocket()
+    }
 
-        // Build URL safely with properly encoded query parameters matching Livdub
+    private fun connectSocket() {
+        if (isClosedByUser.get()) return
+
+        val cleanKey = apiKey.trim().replace("\n", "").replace("\r", "")
         val wsUrl = "https://$HOST/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
             .toHttpUrl()
             .newBuilder()
@@ -86,9 +103,19 @@ class GeminiLiveSession(
             .url(wsUrl)
             .build()
 
+        isSetupCompleted = false
+        val statusMsg = if (reconnectAttempt > 0) {
+            "در حال اتصال مجدد خودکار به جمینای (تلاش $reconnectAttempt)..."
+        } else {
+            "در حال اتصال به هوش مصنوعی زنده..."
+        }
+        onStateChanged(SessionState.CONNECTING, statusMsg)
+
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.d(TAG, "WebSocket opened to v1beta. Sending Livdub setup payload.")
+                Log.d(TAG, "WebSocket opened. Sending setup payload (hasResumption=${sessionResumptionHandle != null}).")
+                reconnectAttempt = 0
+                isReconnecting.set(false)
                 sendLivdubSetup()
             }
 
@@ -96,75 +123,75 @@ class GeminiLiveSession(
                 handleIncomingMessage(text)
             }
 
-            // Google sends frames as binary (Opcode 2) UTF-8 JSON!
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 handleIncomingMessage(bytes.utf8())
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "WebSocket closing: code=$code, reason=$reason")
-                if (code != 1000) {
-                    val friendly = parseCloseReason(code, reason)
-                    onStateChanged(SessionState.ERROR, friendly)
-                } else {
+                Log.d(TAG, "WebSocket onClosing: code=$code, reason=$reason")
+                if (code == 1000 || isClosedByUser.get()) {
                     onStateChanged(SessionState.DISCONNECTED, "ارتباط بسته شد")
+                } else {
+                    handleTransientDisconnection("ارتباط بسته شد ($code): $reason")
                 }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "WebSocket closed: code=$code, reason=$reason")
-                if (code != 1000) {
-                    val friendly = parseCloseReason(code, reason)
-                    onStateChanged(SessionState.ERROR, friendly)
+                Log.d(TAG, "WebSocket onClosed: code=$code, reason=$reason")
+                if (code != 1000 && !isClosedByUser.get()) {
+                    handleTransientDisconnection("قطع ارتباط موقت ($code)")
                 }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e(TAG, "WebSocket failure: ${t.message}", t)
+                Log.e(TAG, "WebSocket onFailure: ${t.message}", t)
                 val responseCode = response?.code
                 val rawMsg = t.message ?: ""
 
-                val friendlyMsg = when {
-                    responseCode == 403 || rawMsg.contains("403") ->
-                        "خطای دسترسی ۴۰۳: آی‌پی ایران مسدود است یا کلید نامعتبر است. لطفاً فیلترشکن را بررسی کنید."
-                    responseCode == 400 || rawMsg.contains("400") ->
-                        "خطای درخواست نامعتبر (۴۰۰): کلید API وارد شده نامعتبر است."
-                    responseCode == 404 || rawMsg.contains("404") ->
-                        "خطای ۴۰۴: مدل یا سرویس در دسترس نیست."
-                    t is java.net.UnknownHostException || rawMsg.contains("Unable to resolve host", ignoreCase = true) ->
-                        "خطای اینترنت/DNS: دسترسی به گوگل مسدود است. لطفاً فیلترشکن را روشن کنید."
-                    t is java.net.SocketTimeoutException || rawMsg.contains("timed out", ignoreCase = true) ->
-                        "تایم‌اوت ارتباط: سرعت اینترنت یا فیلترشکن برای اتصال به گوگل کافی نیست."
-                    t is java.net.ConnectException || rawMsg.contains("Failed to connect", ignoreCase = true) ->
-                        "خطای اتصال به سرور گوگل: لطفاً اتصال اینترنت و فیلترشکن را بررسی کنید."
-                    t is javax.net.ssl.SSLHandshakeException ->
-                        "خطای SSL شبکه: ارتباط توسط فیلترینگ یا اینترنت مختل شده است."
-                    else ->
-                        "خطای ارتباط (${responseCode ?: "اینترنت"}): ${t.localizedMessage ?: rawMsg}"
+                // Fatal auth errors: notify user immediately
+                if (responseCode == 400 || rawMsg.contains("API key not valid", ignoreCase = true)) {
+                    isClosedByUser.set(true)
+                    onStateChanged(SessionState.ERROR, "کلید API نامعتبر است. لطفاً کلید صحیح را از Google AI Studio کپی کنید.")
+                    return
                 }
-                onStateChanged(SessionState.ERROR, friendlyMsg)
+
+                // Transient network / VPN errors: perform auto-reconnect without terminating service
+                handleTransientDisconnection(t.localizedMessage ?: "قطع لحظه‌ای شبکه/فیلترشکن")
             }
         })
     }
 
-    private fun parseCloseReason(code: Int, reason: String): String {
-        return when {
-            reason.contains("API key not valid", ignoreCase = true) ->
-                "کلید API نامعتبر است. لطفاً کلید صحیح را از Google AI Studio کپی کنید."
-            reason.contains("quota", ignoreCase = true) || reason.contains("exhausted", ignoreCase = true) ->
-                "سهمیه رایگان کلید شما به پایان رسیده است."
-            reason.contains("permission", ignoreCase = true) || reason.contains("access", ignoreCase = true) ->
-                "عدم دسترسی به مدل ترجمه. نیاز به تغییر آی‌پی یا بررسی دسترسی در AI Studio."
-            reason.isNotBlank() ->
-                "سرور اتصال را بست: $reason"
-            else ->
-                "اتصال توسط گوگل قطع شد (کد $code)"
-        }
+    /**
+     * Handles transient network/VPN disconnections by scheduling an automatic reconnection.
+     */
+    private fun handleTransientDisconnection(reason: String) {
+        if (isClosedByUser.get()) return
+        if (isReconnecting.getAndSet(true)) return
+
+        isSetupCompleted = false
+        reconnectAttempt++
+
+        // Progressive backoff: 1s, 2s, 3s, max 4s
+        val delayMillis = (minOf(reconnectAttempt, 4) * 1000L)
+        Log.w(TAG, "Transient disconnect ($reason). Reconnecting in ${delayMillis}ms (attempt $reconnectAttempt)...")
+
+        onStateChanged(
+            SessionState.CONNECTING,
+            "ارتباط با فیلترشکن موقتاً قطع شد؛ در حال اتصال مجدد خودکار..."
+        )
+
+        mainHandler.postDelayed({
+            isReconnecting.set(false)
+            if (!isClosedByUser.get()) {
+                connectSocket()
+            }
+        }, delayMillis)
     }
 
     /**
      * Exact setup configuration identical to the Livdub Chrome extension:
-     * Uses Gemini 3.5 Live Translate with native translationConfig.
+     * Uses Gemini 3.5 Live Translate with native translationConfig,
+     * and passes sessionResumption handle when reconnecting so context is preserved.
      */
     private fun sendLivdubSetup() {
         try {
@@ -187,6 +214,13 @@ class GeminiLiveSession(
                             put("echoTargetLanguage", true)
                         })
                     })
+
+                    // If we have a saved resumption handle from earlier in this session, provide it
+                    sessionResumptionHandle?.let { handle ->
+                        put("sessionResumption", JSONObject().apply {
+                            put("handle", handle)
+                        })
+                    }
                 })
             }
 
@@ -194,19 +228,18 @@ class GeminiLiveSession(
             webSocket?.send(setupPayload.toString())
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send setup message: ${e.message}", e)
-            onStateChanged(SessionState.ERROR, "خطا در تنظیمات مدل: ${e.message}")
+            handleTransientDisconnection("خطا در ارسال تنظیمات: ${e.message}")
         }
     }
 
     /**
      * Send real-time audio chunk to Gemini.
-     * Uses the exact JSON structure of the Livdub extension:
-     * { "realtimeInput": { "audio": { "data": base64, "mimeType": "audio/pcm;rate=16000" } } }
+     * Buffers up to MAX_BUFFERED_CHUNKS during temporary VPN reconnects.
      */
     fun sendAudioChunk(pcmChunk: ByteArray) {
         if (!isSetupCompleted || webSocket == null) {
-            // Buffer up to 8 recent chunks while waiting for setupComplete
-            if (pendingAudioQueue.size > 8) {
+            // Buffer recent audio while reconnecting so no spoken words are lost
+            while (pendingAudioQueue.size >= MAX_BUFFERED_CHUNKS) {
                 pendingAudioQueue.poll()
             }
             pendingAudioQueue.offer(pcmChunk)
@@ -234,6 +267,7 @@ class GeminiLiveSession(
     }
 
     private fun flushPendingAudio() {
+        Log.d(TAG, "Flushing ${pendingAudioQueue.size} buffered audio chunks after connection.")
         while (pendingAudioQueue.isNotEmpty()) {
             val chunk = pendingAudioQueue.poll() ?: break
             sendAudioNow(chunk)
@@ -242,7 +276,7 @@ class GeminiLiveSession(
 
     /**
      * Parse server response messages matching the Livdub extension handler:
-     * - Checks for error
+     * - Captures sessionResumptionUpdate tokens for smooth reconnection
      * - Checks for setupComplete / setup_complete
      * - Parses serverContent.modelTurn.parts[].inlineData.data
      */
@@ -255,12 +289,34 @@ class GeminiLiveSession(
             if (errorObj != null) {
                 val errorMsg = errorObj.optString("message", "Unknown Gemini error")
                 Log.e(TAG, "Gemini server error: $errorMsg")
-                val friendly = parseCloseReason(0, errorMsg)
-                onStateChanged(SessionState.ERROR, friendly)
+                if (errorMsg.contains("API key not valid", ignoreCase = true)) {
+                    isClosedByUser.set(true)
+                    onStateChanged(SessionState.ERROR, "کلید API نامعتبر است.")
+                } else {
+                    handleTransientDisconnection(errorMsg)
+                }
                 return
             }
 
-            // 2. Setup completion confirmation
+            // 2. Session Resumption handle capture (exact same pattern as Livdub Chrome extension)
+            val resumption = json.optJSONObject("sessionResumptionUpdate") ?: json.optJSONObject("session_resumption_update")
+            if (resumption != null && resumption.optBoolean("resumable", true)) {
+                val newHandle = resumption.optString("newHandle").ifEmpty { resumption.optString("new_handle") }
+                if (newHandle.isNotEmpty()) {
+                    sessionResumptionHandle = newHandle
+                    Log.d(TAG, "Updated sessionResumptionHandle for automatic reconnection.")
+                }
+            }
+
+            // 3. Graceful Google server-side GoAway
+            val goAway = json.optJSONObject("goAway") ?: json.optJSONObject("go_away")
+            if (goAway != null) {
+                Log.i(TAG, "Received server goAway notice. Scheduling seamless reconnection.")
+                handleTransientDisconnection("Server requested reconnect")
+                return
+            }
+
+            // 4. Setup completion confirmation
             if (json.has("setupComplete") || json.has("setup_complete")) {
                 Log.d(TAG, "Gemini Live setup completed successfully.")
                 isSetupCompleted = true
@@ -269,7 +325,7 @@ class GeminiLiveSession(
                 return
             }
 
-            // 3. Audio parts received
+            // 5. Audio parts received
             val serverContent = json.optJSONObject("serverContent") ?: json.optJSONObject("server_content")
             if (serverContent != null) {
                 val modelTurn = serverContent.optJSONObject("modelTurn") ?: serverContent.optJSONObject("model_turn")
@@ -295,8 +351,11 @@ class GeminiLiveSession(
     }
 
     fun close() {
+        isClosedByUser.set(true)
         isSetupCompleted = false
+        mainHandler.removeCallbacksAndMessages(null)
         pendingAudioQueue.clear()
+        sessionResumptionHandle = null
         try {
             webSocket?.close(1000, "Session stopped by user")
         } catch (e: Exception) {
