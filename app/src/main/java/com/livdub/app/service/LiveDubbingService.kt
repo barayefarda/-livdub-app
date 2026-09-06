@@ -13,7 +13,6 @@ import android.os.Looper
 import android.util.Log
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
-import androidx.core.app.ServiceCompat
 import com.livdub.app.MainActivity
 import com.livdub.app.R
 import com.livdub.app.audio.DubbedAudioPlayer
@@ -21,23 +20,24 @@ import com.livdub.app.audio.InternalAudioCapture
 import com.livdub.app.gemini.GeminiLiveSession
 
 /**
- * Foreground Service running in background to capture internal phone audio
- * and stream it to Gemini for instantaneous voice dubbing.
- * Compatible with Android 10 up to Android 14+ (API 34).
+ * Foreground Service that handles the lifetime of background audio capture
+ * and the real-time AI live dubbing session.
  */
 class LiveDubbingService : Service() {
 
     companion object {
-        const val TAG = "LiveDubbingService"
-        const val CHANNEL_ID = "livdub_foreground_channel"
-        const val NOTIFICATION_ID = 901
+        private const val TAG = "LiveDubbingService"
+        const val CHANNEL_ID = "livdub_foreground_service"
+        const val NOTIFICATION_ID = 1001
 
-        const val ACTION_START = "com.livdub.app.ACTION_START"
-        const val ACTION_STOP = "com.livdub.app.ACTION_STOP"
+        const val ACTION_START = "com.livdub.app.action.START"
+        const val ACTION_STOP = "com.livdub.app.action.STOP"
+
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
         const val EXTRA_API_KEY = "extra_api_key"
         const val EXTRA_TARGET_LANG = "extra_target_lang"
+        const val EXTRA_VOLUME_BOOST = "extra_volume_boost"
 
         var isRunning = false
             private set
@@ -56,40 +56,41 @@ class LiveDubbingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action
+        if (intent == null) return START_NOT_STICKY
 
-        if (action == ACTION_STOP) {
-            stopDubbing()
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        when (intent.action) {
+            ACTION_START -> {
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                val resultData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                }
+                val apiKey = intent.getStringExtra(EXTRA_API_KEY) ?: ""
+                val targetLang = intent.getStringExtra(EXTRA_TARGET_LANG) ?: "Persian (Farsi)"
+                val volumeBoost = intent.getFloatExtra(EXTRA_VOLUME_BOOST, 2.8f)
 
-        if (action == ACTION_START) {
-            val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
-            val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(EXTRA_RESULT_DATA)
-            }
-            val apiKey = intent.getStringExtra(EXTRA_API_KEY) ?: ""
-            val targetLang = intent.getStringExtra(EXTRA_TARGET_LANG) ?: "Persian (Farsi)"
-
-            if (resultCode == Activity.RESULT_OK && resultData != null) {
-                try {
-                    // In Android 14 (API 34), startForeground with FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                    // MUST be invoked BEFORE calling getMediaProjection.
-                    startForegroundWithProjectionType("Starting live audio dubbing...")
-                    startDubbing(resultCode, resultData, apiKey, targetLang)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Crash prevented in onStartCommand: ${e.message}", e)
-                    Handler(Looper.getMainLooper()).post {
-                        Toast.makeText(applicationContext, "Error starting dubbing: ${e.message}", Toast.LENGTH_LONG).show()
+                if (resultCode == Activity.RESULT_OK && resultData != null) {
+                    try {
+                        // CRITICAL FOR ANDROID 14+ (API 34+):
+                        // startForeground() with FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                        // MUST be invoked BEFORE calling getMediaProjection.
+                        startForegroundWithProjectionType("Starting live audio dubbing...")
+                        startDubbing(resultCode, resultData, apiKey, targetLang, volumeBoost)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Crash prevented in onStartCommand: ${e.message}", e)
+                        Handler(Looper.getMainLooper()).post {
+                            Toast.makeText(this, "خطا در شروع سرویس: ${e.message}", Toast.LENGTH_LONG).show()
+                        }
+                        stopSelf()
                     }
+                } else {
                     stopSelf()
                 }
-            } else {
-                Log.w(TAG, "Invalid result data for media projection")
+            }
+            ACTION_STOP -> {
+                stopDubbing()
                 stopSelf()
             }
         }
@@ -97,26 +98,25 @@ class LiveDubbingService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startForegroundWithProjectionType(statusText: String) {
-        val notification = buildNotification(statusText)
+    private fun startForegroundWithProjectionType(contentText: String) {
+        val notification = buildNotification(contentText)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ServiceCompat.startForeground(
-                this,
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            )
+            var serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                serviceType = serviceType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            startForeground(NOTIFICATION_ID, notification, serviceType)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
     }
 
-    private fun startDubbing(resultCode: Int, resultData: Intent, apiKey: String, targetLang: String) {
+    private fun startDubbing(resultCode: Int, resultData: Intent, apiKey: String, targetLang: String, volumeBoost: Float = 2.8f) {
         isRunning = true
 
         try {
-            // 1. Initialize output player with ducking capability
-            dubbedPlayer = DubbedAudioPlayer(context = this, sampleRate = 24000)
+            // 1. Initialize output player with ducking capability and digital gain boost
+            dubbedPlayer = DubbedAudioPlayer(context = this, sampleRate = 24000, volumeBoost = volumeBoost)
 
             // 2. Initialize Gemini Live connection
             geminiSession = GeminiLiveSession(
@@ -125,49 +125,27 @@ class LiveDubbingService : Service() {
                 onIncomingAudioChunk = { pcmAudio ->
                     dubbedPlayer?.writePcmChunk(pcmAudio)
                 },
-                onStateChanged = { state, msg ->
-                    Log.d(TAG, "Gemini State: $state - $msg")
-                    updateNotification(msg ?: "Dubbing active")
+                onStateChanged = { state, message ->
+                    updateNotification("Gemini: ${message ?: state.name}")
                 }
             )
             geminiSession?.start()
 
-            // 3. Initialize MediaProjection & Audio Capture
-            val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            val projection = mpManager.getMediaProjection(resultCode, resultData)
-            if (projection == null) {
-                Log.e(TAG, "MediaProjection returned null")
-                stopDubbing()
-                stopSelf()
-                return
-            }
-            mediaProjection = projection
-
-            // In Android 14, registering a callback is strictly required before using MediaProjection
-            val mainHandler = Handler(Looper.getMainLooper())
-            projection.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() {
-                    super.onStop()
-                    Log.d(TAG, "MediaProjection session stopped")
-                    stopDubbing()
-                    stopSelf()
-                }
-            }, mainHandler)
+            // 3. Initialize Audio Capture from MediaProjection
+            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                audioCapture = InternalAudioCapture(projection) { audioChunk ->
-                    // Feed captured system audio into Gemini live stream
+                audioCapture = InternalAudioCapture(mediaProjection!!) { audioChunk ->
                     geminiSession?.sendAudioChunk(audioChunk)
                 }
                 audioCapture?.startCapture()
             }
+
+            updateNotification("دوبله زنده هوش مصنوعی فعال است")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed during startDubbing: ${e.message}", e)
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(applicationContext, "Capture error: ${e.message}", Toast.LENGTH_LONG).show()
-            }
+            Log.e(TAG, "Error starting dubbing: ${e.message}", e)
             stopDubbing()
-            stopSelf()
         }
     }
 
@@ -175,78 +153,67 @@ class LiveDubbingService : Service() {
         isRunning = false
         try {
             audioCapture?.stopCapture()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping audio capture: ${e.message}")
-        }
-        audioCapture = null
-
-        try {
-            mediaProjection?.stop()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping media projection: ${e.message}")
-        }
-        mediaProjection = null
-
-        try {
+            audioCapture = null
             geminiSession?.close()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing gemini session: ${e.message}")
-        }
-        geminiSession = null
-
-        try {
+            geminiSession = null
             dubbedPlayer?.release()
+            dubbedPlayer = null
+            mediaProjection?.stop()
+            mediaProjection = null
         } catch (e: Exception) {
-            Log.e(TAG, "Error releasing audio player: ${e.message}")
+            Log.e(TAG, "Error stopping dubbing: ${e.message}")
         }
-        dubbedPlayer = null
+    }
+
+    private fun updateNotification(contentText: String) {
+        val notification = buildNotification(contentText)
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun buildNotification(contentText: String): Notification {
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val pendingOpenIntent = PendingIntent.getActivity(
+            this,
+            0,
+            openAppIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val stopIntent = Intent(this, LiveDubbingService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val pendingStopIntent = PendingIntent.getService(
+            this,
+            1,
+            stopIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Livdub AI - دوبله زنده فعال")
+            .setContentText(contentText)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentIntent(pendingOpenIntent)
+            .addAction(R.mipmap.ic_launcher, "توقف", pendingStopIntent)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Livdub Dubbing Service",
+                "Livdub Live Dubbing Service",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Shows status of real-time audio dubbing"
+                description = "نمایش وضعیت دوبله همزمان در پس‌زمینه"
             }
             val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
-        }
-    }
-
-    private fun buildNotification(statusText: String): Notification {
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val stopIntent = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, LiveDubbingService::class.java).apply { action = ACTION_STOP },
-            PendingIntent.FLAG_IMMUTABLE
-        )
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Livdub Live Dubbing")
-            .setContentText(statusText)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentIntent(pendingIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)
-            .setOngoing(true)
-            .build()
-    }
-
-    private fun updateNotification(statusText: String) {
-        try {
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.notify(NOTIFICATION_ID, buildNotification(statusText))
-        } catch (e: Exception) {
-            Log.e(TAG, "Could not update notification: ${e.message}")
+            manager?.createNotificationChannel(channel)
         }
     }
 
