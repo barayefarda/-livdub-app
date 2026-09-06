@@ -26,7 +26,7 @@ class GeminiLiveSession(
 
     companion object {
         private const val TAG = "GeminiLiveSession"
-        private const val MODEL_NAME = "models/gemini-2.0-flash-realtime-exp"
+        private const val MODEL_NAME = "models/gemini-2.0-flash-exp"
         private const val HOST = "generativelanguage.googleapis.com"
     }
 
