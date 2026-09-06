@@ -8,7 +8,14 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * Manages two-way real-time streaming WebSocket connection with Gemini Live API
+ * Manages two-way real-time streaming WebSocket connection with Gemini Live API,
+ * using the EXACT same endpoint, model, and payload format as the official Livdub extension:
+ *
+ * 1. Endpoint: /ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent
+ * 2. Model: models/gemini-3.5-live-translate-preview
+ * 3. Config: translationConfig with targetLanguageCode ("fa") and echoTargetLanguage
+ * 4. Audio Input: realtimeInput.audio { data, mimeType: "audio/pcm;rate=16000" }
+ * 5. Audio Output: serverContent.modelTurn.parts[].inlineData.data (24kHz PCM)
  */
 class GeminiLiveSession(
     private val apiKey: String,
@@ -26,8 +33,22 @@ class GeminiLiveSession(
 
     companion object {
         private const val TAG = "GeminiLiveSession"
-        private const val MODEL_NAME = "models/gemini-2.0-flash-exp"
+        // The exact live speech-to-speech translation model used by Livdub
+        private const val MODEL_NAME = "models/gemini-3.5-live-translate-preview"
         private const val HOST = "generativelanguage.googleapis.com"
+    }
+
+    private val targetLanguageCode: String = when {
+        targetLanguage.contains("fa", ignoreCase = true) ||
+                targetLanguage.contains("farsi", ignoreCase = true) ||
+                targetLanguage.contains("persian", ignoreCase = true) -> "fa"
+        targetLanguage.contains("ar", ignoreCase = true) -> "ar"
+        targetLanguage.contains("tr", ignoreCase = true) -> "tr"
+        targetLanguage.contains("en", ignoreCase = true) -> "en"
+        targetLanguage.contains("de", ignoreCase = true) -> "de"
+        targetLanguage.contains("fr", ignoreCase = true) -> "fr"
+        targetLanguage.contains("es", ignoreCase = true) -> "es"
+        else -> "fa"
     }
 
     private val client = OkHttpClient.Builder()
@@ -39,22 +60,24 @@ class GeminiLiveSession(
 
     private var webSocket: WebSocket? = null
     private var isSetupCompleted = false
+    private val pendingAudioQueue = java.util.concurrent.ConcurrentLinkedQueue<ByteArray>()
 
     fun start() {
         if (apiKey.isBlank()) {
-            onStateChanged(SessionState.ERROR, "کلید API وارد نشده است")
+            onStateChanged(SessionState.ERROR, "کلید API وارد نشده است (API key missing)")
             return
         }
 
-        onStateChanged(SessionState.CONNECTING, "در حال اتصال به جمینای...")
+        onStateChanged(SessionState.CONNECTING, "در حال اتصال به جمینای لایو (Connecting to Gemini Live)...")
 
-        val url = "wss://$HOST/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=$apiKey"
+        // Exact endpoint matching the Livdub Chrome Extension (v1beta)
+        val url = "wss://$HOST/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
         val request = Request.Builder().url(url).build()
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.d(TAG, "WebSocket opened. Sending initial setup payload.")
-                sendInitialSetup()
+                Log.d(TAG, "WebSocket opened to v1beta. Sending Livdub setup payload.")
+                sendLivdubSetup()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -71,9 +94,9 @@ class GeminiLiveSession(
                 val rawMsg = t.message ?: ""
                 val friendlyMsg = when {
                     rawMsg.contains("ping", ignoreCase = true) || rawMsg.contains("timed out", ignoreCase = true) ->
-                        "تایم‌اوت ارتباط: فیلترشکن را بررسی کنید"
+                        "تایم‌اوت ارتباط: لطفاً وضعیت فیلترشکن را بررسی کنید"
                     rawMsg.contains("Failed to connect", ignoreCase = true) ->
-                        "عدم دسترسی به گوگل: اتصال فیلترشکن را بررسی کنید"
+                        "عدم دسترسی به گوگل: اتصال اینترنت و فیلترشکن را بررسی کنید"
                     rawMsg.contains("403", ignoreCase = true) ->
                         "خطای دسترسی ۴۰۳: کلید API نامعتبر است یا کشور تحریم است"
                     else ->
@@ -84,7 +107,11 @@ class GeminiLiveSession(
         })
     }
 
-    private fun sendInitialSetup() {
+    /**
+     * Exact setup configuration identical to the Livdub Chrome extension:
+     * Uses Gemini 3.5 Live Translate with native translationConfig.
+     */
+    private fun sendLivdubSetup() {
         try {
             val setupPayload = JSONObject().apply {
                 put("setup", JSONObject().apply {
@@ -100,46 +127,48 @@ class GeminiLiveSession(
                                 })
                             })
                         })
-                    })
-                    put("systemInstruction", JSONObject().apply {
-                        put("parts", JSONArray().apply {
-                            put(JSONObject().apply {
-                                put(
-                                    "text",
-                                    "You are a professional simultaneous live audio dubber and interpreter. " +
-                                            "You will receive live streaming audio in real-time. Immediately translate the spoken content " +
-                                            "into fluent, natural, spoken $targetLanguage. " +
-                                            "Do not add conversational filler, do not ask questions, do not explain anything. " +
-                                            "Directly output the dubbed voice in $targetLanguage matching the cadence and tone of the speaker."
-                                )
-                            })
+                        put("translationConfig", JSONObject().apply {
+                            put("targetLanguageCode", targetLanguageCode)
+                            put("echoTargetLanguage", true)
                         })
                     })
                 })
             }
 
+            Log.d(TAG, "Sending setup: $setupPayload")
             webSocket?.send(setupPayload.toString())
-            isSetupCompleted = true
-            onStateChanged(SessionState.CONNECTED, "دوبله زنده فعال است ($targetLanguage)")
-            Log.d(TAG, "Setup sent successfully.")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send setup message: ${e.message}", e)
-            onStateChanged(SessionState.ERROR, "خطا در تنظیمات مدل: ${e.message}")
+            onStateChanged(SessionState.ERROR, "خطا در برقراری ارتباط با مدل: ${e.message}")
         }
     }
 
+    /**
+     * Send real-time audio chunk to Gemini.
+     * Uses the exact JSON structure of the Livdub extension:
+     * { "realtimeInput": { "audio": { "data": base64, "mimeType": "audio/pcm;rate=16000" } } }
+     */
     fun sendAudioChunk(pcmChunk: ByteArray) {
-        if (!isSetupCompleted || webSocket == null) return
+        if (!isSetupCompleted || webSocket == null) {
+            // Buffer up to 8 recent chunks while waiting for setupComplete
+            if (pendingAudioQueue.size > 8) {
+                pendingAudioQueue.poll()
+            }
+            pendingAudioQueue.offer(pcmChunk)
+            return
+        }
 
+        sendAudioNow(pcmChunk)
+    }
+
+    private fun sendAudioNow(pcmChunk: ByteArray) {
         try {
             val base64Data = Base64.encodeToString(pcmChunk, Base64.NO_WRAP)
             val realtimeInput = JSONObject().apply {
                 put("realtimeInput", JSONObject().apply {
-                    put("mediaChunks", JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("mimeType", "audio/pcm;rate=16000")
-                            put("data", base64Data)
-                        })
+                    put("audio", JSONObject().apply {
+                        put("data", base64Data)
+                        put("mimeType", "audio/pcm;rate=16000")
                     })
                 })
             }
@@ -149,21 +178,58 @@ class GeminiLiveSession(
         }
     }
 
+    private fun flushPendingAudio() {
+        while (pendingAudioQueue.isNotEmpty()) {
+            val chunk = pendingAudioQueue.poll() ?: break
+            sendAudioNow(chunk)
+        }
+    }
+
+    /**
+     * Parse server response messages matching the Livdub extension handler:
+     * - Checks for error
+     * - Checks for setupComplete / setup_complete
+     * - Parses serverContent.modelTurn.parts[].inlineData.data
+     */
     private fun handleIncomingMessage(text: String) {
         try {
             val json = JSONObject(text)
-            val serverContent = json.optJSONObject("serverContent") ?: return
-            val modelTurn = serverContent.optJSONObject("modelTurn") ?: return
-            val parts = modelTurn.optJSONArray("parts") ?: return
 
-            for (i in 0 until parts.length()) {
-                val part = parts.getJSONObject(i)
-                val inlineData = part.optJSONObject("inlineData")
-                if (inlineData != null) {
-                    val b64Data = inlineData.optString("data")
-                    if (b64Data.isNotEmpty()) {
-                        val pcmBytes = Base64.decode(b64Data, Base64.DEFAULT)
-                        onIncomingAudioChunk(pcmBytes)
+            // 1. Error handling from server
+            val errorObj = json.optJSONObject("error")
+            if (errorObj != null) {
+                val errorMsg = errorObj.optString("message", "Unknown Gemini error")
+                Log.e(TAG, "Gemini server error: $errorMsg")
+                onStateChanged(SessionState.ERROR, errorMsg)
+                return
+            }
+
+            // 2. Setup completion confirmation
+            if (json.has("setupComplete") || json.has("setup_complete")) {
+                Log.d(TAG, "Gemini Live setup completed successfully.")
+                isSetupCompleted = true
+                onStateChanged(SessionState.CONNECTED, "دوبله زنده فعال شد (زبان مقصد: فارسی)")
+                flushPendingAudio()
+                return
+            }
+
+            // 3. Audio parts received
+            val serverContent = json.optJSONObject("serverContent") ?: json.optJSONObject("server_content")
+            if (serverContent != null) {
+                val modelTurn = serverContent.optJSONObject("modelTurn") ?: serverContent.optJSONObject("model_turn")
+                val parts = modelTurn?.optJSONArray("parts")
+
+                if (parts != null) {
+                    for (i in 0 until parts.length()) {
+                        val part = parts.getJSONObject(i)
+                        val inlineData = part.optJSONObject("inlineData") ?: part.optJSONObject("inline_data")
+                        if (inlineData != null) {
+                            val b64Data = inlineData.optString("data")
+                            if (b64Data.isNotEmpty()) {
+                                val pcmBytes = Base64.decode(b64Data, Base64.DEFAULT)
+                                onIncomingAudioChunk(pcmBytes)
+                            }
+                        }
                     }
                 }
             }
@@ -174,6 +240,7 @@ class GeminiLiveSession(
 
     fun close() {
         isSetupCompleted = false
+        pendingAudioQueue.clear()
         try {
             webSocket?.close(1000, "Session stopped by user")
         } catch (e: Exception) {
