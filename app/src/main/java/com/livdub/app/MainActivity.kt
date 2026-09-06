@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -31,6 +32,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.livdub.app.service.FloatingBubbleService
 import com.livdub.app.service.LiveDubbingService
 
@@ -44,8 +46,24 @@ class MainActivity : ComponentActivity() {
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             startDubbingService(result.resultCode, result.data!!)
         } else {
-            Toast.makeText(this, "Audio capture permission denied", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Screen/audio capture permission denied", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private val audioPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            requestNotificationThenProjection()
+        } else {
+            Toast.makeText(this, "Audio recording permission is required for system dubbing", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        launchMediaProjectionPicker()
     }
 
     private val overlayPermissionLauncher = registerForActivityResult(
@@ -102,8 +120,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startBubbleService() {
-        startService(Intent(this, FloatingBubbleService::class.java))
-        Toast.makeText(this, "Floating bubble enabled! Tap anytime to dub.", Toast.LENGTH_SHORT).show()
+        try {
+            startService(Intent(this, FloatingBubbleService::class.java))
+            Toast.makeText(this, "Floating bubble enabled! Tap anytime to dub.", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Could not start bubble: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun checkAndRequestPermissions() {
@@ -113,9 +135,31 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // Request system audio capture via MediaProjection
-        val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projectionLauncher.launch(mpManager.createScreenCaptureIntent())
+        // 1. First check RECORD_AUDIO runtime permission
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            requestNotificationThenProjection()
+        }
+    }
+
+    private fun requestNotificationThenProjection() {
+        // 2. On Android 13+ check notification permission
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            launchMediaProjectionPicker()
+        }
+    }
+
+    private fun launchMediaProjectionPicker() {
+        try {
+            val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projectionLauncher.launch(mpManager.createScreenCaptureIntent())
+        } catch (e: Exception) {
+            Toast.makeText(this, "Failed to launch screen capture: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun startDubbingService(resultCode: Int, data: Intent) {
@@ -130,10 +174,14 @@ class MainActivity : ComponentActivity() {
             putExtra(LiveDubbingService.EXTRA_TARGET_LANG, targetLang)
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Could not start service: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
