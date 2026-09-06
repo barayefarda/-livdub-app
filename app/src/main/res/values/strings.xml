@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Livdub</string>
+    <string name="service_channel_name">Livdub Live Dubbing</string>
+    <string name="service_channel_desc">Active internal audio capture and live voice dubbing</string>
+</resources>
